@@ -35,5 +35,3 @@ src/RefractorForge.Viewer/Assets/ffmpeg/*.exe
 *.bik
 *.zip
 
-# Claude Code project instructions (AI tooling notes, kept local; not part of the public source)
-CLAUDE.md
