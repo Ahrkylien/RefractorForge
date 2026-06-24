@@ -23,7 +23,8 @@ When a parameter or argument list is too long to fit on one line, place each ite
 
 ```csharp
 // Parameters
-public void SomeMethod(
+public void SomeMethod
+(
     int alpha,
     string beta,
     CancellationToken cancellationToken,
@@ -32,7 +33,8 @@ public void SomeMethod(
 }
 
 // Arguments
-SomeMethod(
+SomeMethod
+(
     alpha,
     beta,
     cancellationToken,
