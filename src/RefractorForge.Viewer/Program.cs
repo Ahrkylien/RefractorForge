@@ -408,6 +408,11 @@ void main(){ gl_Position = uLightSpace * uModel * vec4(aPos, 1.0); }";
 const string DepthFrag = @"#version 330 core
 void main(){}";
 
+// Project state - declared here so the startup block below can assign them.
+bool isRelaunch = args.Any(a => a == "--relaunch");
+bool showStartupScreen = false;
+string? currentProjectPath = null;
+
 // Resolve the level folder + mesh archives, in priority order:
 //   1. explicit command-line paths (back-compat with scripts);
 //   2. saved selections from a previous run (refractorforge.json beside the exe);
@@ -418,38 +423,44 @@ string[] meshArchives = Array.Empty<string>();     // standardMesh/objects .rfa 
 string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (their folders are also scanned for siblings)
 {
     var pathArgs = args.Where(a => !a.StartsWith("-", StringComparison.Ordinal)).ToArray();
-    bool forcePick = args.Any(a => a is "--pick" or "-p");
-    if (pathArgs.Length >= 1)
+    bool forcePick  = args.Any(a => a is "--pick" or "-p");
+    // isRelaunch is declared above the startup block so window opts can read it.
+    string? rfprojArg = pathArgs.Length >= 1
+        && pathArgs[0].EndsWith(".rfproj", StringComparison.OrdinalIgnoreCase)
+        && File.Exists(pathArgs[0]) ? pathArgs[0] : null;
+
+    if (pathArgs.Length >= 1 && rfprojArg is null)
     {
+        // Legacy: explicit level folder / archive paths (back-compat with scripts and external launchers).
         levelDir = pathArgs[0];
         meshArchives = pathArgs.Skip(1).Where(a => a.EndsWith(".rfa", StringComparison.OrdinalIgnoreCase)).ToArray();
     }
-    else
+    else if ((isRelaunch || rfprojArg is not null) && !forcePick && rfprojArg is not null)
     {
-        var saved = Settings.Load();
-        // Reuse the remembered level whether it's an extracted FOLDER or one-or-more packed .rfa FILEs.
-        if (!forcePick && saved is { Level: string sl } && (Directory.Exists(sl) || File.Exists(sl)))
+        // Relaunched from a project file, or opened via file association — load directly from the .rfproj.
+        var pf = ProjectFile.Load(rfprojArg);
+        if (pf is not null)
         {
-            levelDir = sl;
-            levelArchives = (saved.LevelArchives is { Length: > 0 } la ? la
-                             : (File.Exists(sl) && sl.EndsWith(".rfa", StringComparison.OrdinalIgnoreCase) ? new[] { sl } : Array.Empty<string>()))
-                            .Where(File.Exists).ToArray();
-            meshArchives = (saved.MeshArchives is { Length: > 0 } ma ? ma : new[] { saved.StdMesh, saved.Objects })
-                .Where(p => !string.IsNullOrEmpty(p) && File.Exists(p)).Select(p => p!).ToArray();
-            texPicks = (saved.Textures ?? Array.Empty<string>()).Where(p => !string.IsNullOrEmpty(p) && File.Exists(p)).ToArray();
+            currentProjectPath = rfprojArg;
+            RecentProjects.Add(rfprojArg);
+            // No LevelArchives → the project folder itself is the extracted level directory.
+            levelDir = pf.LevelArchives.Length > 0
+                ? pf.LevelArchives[0]
+                : System.IO.Path.GetDirectoryName(rfprojArg);
+            levelArchives = pf.LevelArchives.Where(File.Exists).ToArray();
+            meshArchives  = pf.MeshArchives.Where(File.Exists).ToArray();
+            texPicks      = pf.TextureArchives.Where(File.Exists).ToArray();
         }
         else
         {
-            // First run / no saved level: show the splash by itself for ~3s, then use the Open Mod flow (pick the mod
-            // folder, then the map .rfa; the mesh + texture archives are auto-collected from the mod's chain).
-            SplashScreen.WaitVisibleFor(3000);
-            SplashScreen.Close();
-            if (GatherModPaths(out var lvlRfas0, out var meshList0, out var texList0))
-            {
-                levelArchives = lvlRfas0; levelDir = lvlRfas0[0]; meshArchives = meshList0; texPicks = texList0;
-                Settings.Save(new LevelPaths(levelDir, null, null, texPicks, meshArchives, levelArchives.Length > 0 ? levelArchives : null));
-            }
+            RecentProjects.Remove(rfprojArg);
+            showStartupScreen = true;
         }
+    }
+    else
+    {
+        // Fresh launch (or --pick): show the startup project-picker screen.
+        showStartupScreen = true;
     }
 }
 
@@ -665,7 +676,7 @@ catch (Exception loadEx)
         "Opening a demo terrain instead. To open a real map, restart and choose the level FOLDER that " +
         "contains Terrain.con (or its packed .rfa).",
         "RefractorForge - level not loaded");
-    Settings.Save(new LevelPaths(null, null, null));   // forget the bad pick so the next launch re-prompts
+    if (currentProjectPath is not null) RecentProjects.Remove(currentProjectPath);   // forget the bad pick so the next launch re-prompts
     levelDir = null;
     cfg = new TerrainConfig { MaterialSize = 1024, WorldSize = 4096, YScale = 0.5f, WaterLevel = 30 };
     heightmap = HeightmapGenerator.DiamondSquare(cfg.MaterialSize, 2026, 0.55f);
@@ -843,9 +854,12 @@ float minH = float.MaxValue, maxH = float.MinValue;
 foreach (var p in mesh.Positions) { if (p.Y < minH) minH = p.Y; if (p.Y > maxH) maxH = p.Y; }
 
 var opts = WindowOptions.Default;
-opts.Size = new Vector2D<int>(1280, 800);          // restored size when un-maximized
-opts.WindowState = WindowState.Maximized;          // open filling the screen (keeps the title bar + window controls)
-opts.Title = "RefractorForge Viewer";
+opts.Size = new Vector2D<int>(1280, 800);
+opts.WindowState = WindowState.Maximized;
+opts.Title = "RefractorForge";
+// Keep the GL window hidden while the WinForms splash/startup screen is the active UI.
+// It becomes visible once the user confirms a project choice in OnUpdate.
+if (showStartupScreen && SplashScreen.IsShowing) opts.IsVisible = false;
 IWindow window = Window.Create(opts);
 
 GL gl = null!;
@@ -1249,7 +1263,36 @@ float scatterScaleMin = 1f, scatterScaleMax = 1f;   // per-object random size va
 string scatterError = "";
 bool nmPlayable = true;                                // also write a minimal Conquest layer (flags/spawns/kits)
 bool nmGameBf1942 = false;                             // New Map target game (false = BF Vietnam, true = BF1942)
+bool nmFromStartup = false;                            // true when New Map was opened from the startup screen -> cancel returns there
 string nmError = "";
+string[] nmMeshArchives  = Array.Empty<string>();      // mesh/texture archives to store in the new project's .rfproj
+string[] nmTexArchives   = Array.Empty<string>();
+// ---- Open Level RFA modal (archive picker, triggered from splash or File menu) ----
+bool olrRequest      = false;
+bool olrFromStartup  = false;
+string olrName       = "";
+string olrFolder     = "";
+bool olrGameBf1942   = false;
+string[] olrLevelArchives   = Array.Empty<string>();
+string[] olrMeshArchives    = Array.Empty<string>();
+string[] olrTexArchives     = Array.Empty<string>();
+string olrError      = "";
+// ---- Open Level Folder modal state ----
+bool olfRequest     = false;
+bool olfFromStartup = false;
+string olfName      = "";
+string olfLevelDir  = "";
+bool olfGameBf1942  = false;
+string[] olfMeshArchives  = Array.Empty<string>();
+string[] olfTexArchives   = Array.Empty<string>();
+string olfError     = "";
+// ---- Startup screen (Blender-style project picker shown when no project is loaded) ----
+// showStartupScreen / currentProjectPath are declared earlier (before the startup block).
+// ---- Project Settings modal ----
+bool projectSettingsRequest = false;
+bool psGameBf1942 = false;                 // editable copy while the modal is open
+string psModFolder = "";                   // read-only display in the modal
+
 string? browserTemplate = null;                       // template highlighted in the Object Library
 // 3D model viewer: double-click a model in the Object Library to inspect its mesh in an offscreen-rendered window.
 bool meshViewerOpen = false;
@@ -1353,12 +1396,11 @@ void SetAppIcon()
 void OnLoad()
 {
     var loadSw = System.Diagnostics.Stopwatch.StartNew();   // total GL-side load time (reported at the end)
-    // Determine the target game (BF Vietnam vs BF1942) so team names + BFV-only features adapt. A refractorforge.game
-    // sidecar (written by New Map) wins; else infer from the loaded paths. The user can override in the Environment panel.
+    // Determine the target game (BF Vietnam vs BF1942). The .rfproj file is authoritative; fall back to
+    // inferring from the archive/level paths if no project file is loaded. The user can override in the Environment panel.
     {
-        string? side = null;
-        try { if (levelDir is not null && System.IO.Directory.Exists(levelDir)) { var sp = System.IO.Path.Combine(levelDir, "refractorforge.game"); if (System.IO.File.Exists(sp)) side = System.IO.File.ReadAllText(sp).Trim().ToLowerInvariant(); } } catch { }
-        if (side is not null) gameIsBf1942 = side.Contains("1942");
+        string? gameFromProj = currentProjectPath is not null ? ProjectFile.Load(currentProjectPath)?.Game : null;
+        if (gameFromProj is not null) gameIsBf1942 = gameFromProj.Contains("1942", StringComparison.OrdinalIgnoreCase);
         else
         {
             var all = string.Join(" ", new[] { levelDir }.Concat(meshArchives).Concat(levelArchives).Where(p => p is not null)).ToLowerInvariant();
@@ -2276,13 +2318,67 @@ void OnLoad()
     shadowMapDirty = true;
     UploadMarkers();
     Console.WriteLine($"Editor ready: GL-side load took {loadSw.ElapsedMilliseconds} ms.");
-    SplashScreen.Close();       // editor is ready -> dismiss the launch splash
+    if (showStartupScreen && SplashScreen.IsShowing)
+    {
+        // Transition the splash window to the startup project picker (same WinForms window, in-place).
+        SplashScreen.SwitchToStartup(RecentProjects.Load());
+    }
+    else
+    {
+        SplashScreen.Close();   // normal relaunch path - no startup screen needed
+    }
     // Like Battlecraft's "Load Errors" box: if the load produced any warnings (missing meshes etc.), pop the Log window.
     if (ConsoleLog.Snapshot().Any(ConsoleLog.LooksLikeError)) { showLog = true; logErrorsOnly = true; }
 }
 
 void OnUpdate(double dt)
 {
+    // Poll the WinForms startup screen for a project choice (only while GL window is hidden).
+    if (showStartupScreen)
+    {
+        var pick = SplashScreen.PollResult();
+        if (pick is not null)
+        {
+            showStartupScreen = false;
+            if (pick.Action == SplashScreen.StartupAction.OpenProject && pick.ProjectPath is not null)
+            {
+                // Load the chosen .rfproj and relaunch into the editor.
+                RelaunchWithProject(pick.ProjectPath);
+                return;
+            }
+            else if (pick.Action == SplashScreen.StartupAction.NewMap)
+            {
+                // Show the GL window and open the New Map modal.
+                window.IsVisible = true;
+                window.WindowState = WindowState.Maximized;
+                nmFromStartup = true;
+                OpenNewMap();
+            }
+            else if (pick.Action == SplashScreen.StartupAction.OpenLevelRfa && pick.LevelArchives is { Length: > 0 })
+            {
+                // Show the GL window and open the archive picker modal pre-filled with the chosen level archives.
+                window.IsVisible = true;
+                window.WindowState = WindowState.Maximized;
+                olrLevelArchives = pick.LevelArchives;
+                olrName = System.IO.Path.GetFileNameWithoutExtension(pick.LevelArchives[0]);
+                olrGameBf1942 = pick.LevelArchives[0].ToLowerInvariant().Contains("1942");
+                olrFromStartup = true;
+                olrRequest = true;
+            }
+            else if (pick.Action == SplashScreen.StartupAction.OpenLevelFolder && pick.LevelFolder is not null)
+            {
+                // Show the GL window and open the level-folder modal pre-filled with the chosen folder.
+                window.IsVisible = true;
+                window.WindowState = WindowState.Maximized;
+                olfLevelDir    = pick.LevelFolder;
+                olfName        = System.IO.Path.GetFileName(pick.LevelFolder.TrimEnd('\\', '/'));
+                olfGameBf1942  = false;
+                olfFromStartup = true;
+                olfRequest     = true;
+            }
+        }
+        return;   // don't run editor update while startup screen is active
+    }
     if (playSounds && soundPlayback is not null) soundPlayback.Update(cam.Position, PlacedSounds(), dt);   // placed-sound preview (no-op when off)
     UpdateWeather(dt);   // advance the weather preview particles (no-op when off)
     if (showEffects) EnsureEffects();   // lazy-build effect instances on first frame the layer is on
@@ -3603,6 +3699,19 @@ void DoSaveCore()
         var sw = sounds.SaveDirty();
         if (sw.Count > 0) Console.WriteLine($"   Saved {sw.Count} sound script(s) (.ssc).");
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
+        if (currentProjectPath is not null)
+        {
+            try
+            {
+                var pf = ProjectFile.Load(currentProjectPath) ?? new ProjectFile { Name = System.IO.Path.GetFileNameWithoutExtension(currentProjectPath) };
+                // Level dir is implied by the project file's parent folder; no Level field needed.
+                pf.LevelArchives   = Array.Empty<string>();
+                pf.MeshArchives    = meshArchives;
+                pf.TextureArchives = texPicks;
+                pf.Save(currentProjectPath);
+            }
+            catch (Exception ex) { Console.WriteLine($"   .rfproj re-save failed: {ex.Message}"); }
+        }
         return;
     }
     // Loaded from a packed .rfa: re-pack the edited files into the archive (only changed entries
@@ -4050,6 +4159,162 @@ void RebuildTerrain()
     gl.BindBuffer(BufferTargetARB.ArrayBuffer, terrainVbo);
     gl.BufferData<float>(BufferTargetARB.ArrayBuffer, v, BufferUsageARB.DynamicDraw);
     if (stroke is null) gridDirty = true;   // terrain settled (sculpt finish / undo / redo / new map) -> re-drape the grid
+}
+
+// Load (or reload) a directory-based level in-place, without relaunching the process.
+// Frees the old level's GL resources, loads the new level from disk, re-uploads to GL,
+// and resets all editor state. The mesh library (meshLib) is reused as-is.
+void LoadLevelDir(string dir, string? projPath)
+{
+    // ── Reset editor interaction state ──────────────────────────────────────
+    selected = -1; multi.Clear(); gpIndex = -1;
+    gpDragging = false; gpRotDragging = false;
+    stroke = null; matStroke = null; atlasStroke = null;
+    atlasPainted = false; atlasCpu = null;
+    terrainDirty = false;
+    objectLightmapsLoaded = false; objectLightmaps = null;
+    bakedObjectLightmaps.Clear();
+    collisionDirty = true; shadowMapDirty = true; gridDirty = true;
+    waterLevelEdited = false;
+
+    // ── Update path state ────────────────────────────────────────────────────
+    levelDir = dir;
+    rfaList = Array.Empty<string>();
+    levelArchives = Array.Empty<string>();
+    currentProjectPath = projPath;
+    soPath = null; texturesDir = null;
+
+    // ── CPU: load terrain + objects ──────────────────────────────────────────
+    try
+    {
+        string Find(string n) => Directory.EnumerateFiles(dir, n, SearchOption.AllDirectories)
+            .OrderBy(p => p.Count(c => c is '\\' or '/')).FirstOrDefault()
+            ?? throw new FileNotFoundException($"No '{n}' found under {dir}.");
+        cfg         = TerrainConfig.Load(Find("Terrain.con"));
+        heightmap   = Heightmap.LoadForMaterialSize(Find("Heightmap.raw"), cfg.MaterialSize);
+        mesh        = TerrainMesh.FromHeightmap(heightmap, cfg, 1);
+        soPath      = Find("StaticObjects.con");
+        so          = StaticObjectsFile.Load(soPath);
+        gameplay    = GameplayObjects.LoadFolder(dir);
+        gameplayEdit = new EditableGameplay(gameplay);
+        var matFile  = Directory.EnumerateFiles(dir, "MaterialMap.raw", SearchOption.AllDirectories).FirstOrDefault();
+        materialMap  = matFile is not null ? MaterialMap.LoadForMaterialSize(matFile, cfg.MaterialSize) : null;
+        growth       = GrowthMaps.LoadFolder(dir);
+        env          = EnvironmentSettings.LoadFolder(dir);
+        sounds       = SoundLibrary.LoadFolder(dir);
+        loadedShadowBits = LightmapShadowBits.TryLoadFolder(dir);
+        var texDir   = Directory.EnumerateDirectories(dir, "Textures", SearchOption.AllDirectories).FirstOrDefault();
+        texturesDir  = texDir;
+        terrainTex   = texDir is not null ? TerrainTexture.Load(texDir, cfg.WorldSize) : null;
+    }
+    catch (Exception ex)
+    {
+        Picker.Error($"Could not load level:\n\n{ex.Message}", "RefractorForge");
+        return;
+    }
+
+    // ── Rebuild pickers / editors / painters / undo stack ───────────────────
+    terrainPick  = new TerrainPick(heightmap!, cfg);
+    terrainEd    = new TerrainEditor(heightmap!, cfg);
+    matPainter   = materialMap is not null ? new MaterialPainter(materialMap, cfg) : null;
+    underPainter = growth?.Under is not null
+        ? new MaterialPainter(growth.Under, new TerrainConfig { MaterialSize = growth.UnderSide, WorldSize = cfg.WorldSize, YScale = cfg.YScale, WaterLevel = cfg.WaterLevel }) : null;
+    overPainter  = growth?.Over is not null
+        ? new MaterialPainter(growth.Over,  new TerrainConfig { MaterialSize = growth.OverSide,  WorldSize = cfg.WorldSize, YScale = cfg.YScale, WaterLevel = cfg.WaterLevel }) : null;
+    hist = so is not null ? new EditHistory(so) : null;
+    SyncMarkers();
+
+    // ── Update game-type flag ────────────────────────────────────────────────
+    {
+        string? g = projPath is not null ? ProjectFile.Load(projPath)?.Game : null;
+        if (g is not null) gameIsBf1942 = g.Contains("1942", StringComparison.OrdinalIgnoreCase);
+        else { var a = dir.ToLowerInvariant(); if (a.Contains("vietnam")) gameIsBf1942 = false; else if (a.Contains("1942")) gameIsBf1942 = true; }
+    }
+
+    // ── Seed environment state from the new level ────────────────────────────
+    if (env is not null)
+    {
+        fogEnabled = env.FogEnabled;
+        fogColor   = new Vector3(env.FogColor.X,   env.FogColor.Y,   env.FogColor.Z);
+        fogStart   = env.FogStart; fogEnd = env.FogEnd;
+        waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);
+        deepColor  = new Vector3(env.DeepColor.X,  env.DeepColor.Y,  env.DeepColor.Z);
+        waterAlpha = env.WaterAlpha;
+    }
+    waterLevelLoaded = cfg.WaterLevel;
+
+    // ── Recompute height range (used per-frame in uMaxH uniform + camera framing) ──
+    minH = float.MaxValue; maxH = float.MinValue;
+    foreach (var p in mesh!.Positions) { if (p.Y < minH) minH = p.Y; if (p.Y > maxH) maxH = p.Y; }
+
+    // ── Free old level-specific GL textures ─────────────────────────────────
+    if (terrainTexId != 0) { gl.DeleteTexture(terrainTexId); terrainTexId = 0; }
+    if (detailTexId  != 0) { gl.DeleteTexture(detailTexId);  detailTexId  = 0; }
+    if (minimapTexId != 0) { gl.DeleteTexture(minimapTexId); minimapTexId = 0; }
+
+    // ── Recreate terrain VAO/VBO (materialSize may differ from the previous level) ──
+    if (terrainVao != 0) gl.DeleteVertexArray(terrainVao);
+    if (terrainVbo != 0) gl.DeleteBuffer(terrainVbo);
+    float ws = cfg.WorldSize <= 0 ? 1f : cfg.WorldSize;
+    var verts = new float[mesh.Positions.Length * 8];
+    for (int i = 0; i < mesh.Positions.Length; i++)
+    {
+        var p = mesh.Positions[i]; var n = mesh.Normals[i]; int o = i * 8;
+        verts[o] = p.X; verts[o + 1] = p.Y; verts[o + 2] = p.Z;
+        verts[o + 3] = n.X; verts[o + 4] = n.Y; verts[o + 5] = n.Z;
+        verts[o + 6] = p.X / ws; verts[o + 7] = p.Z / ws;
+    }
+    var indices = Array.ConvertAll(mesh.Indices, x => (uint)x);
+    terrainIndexCount = indices.Length;
+    terrainVao = MakeMesh(verts, indices, out terrainVbo);
+
+    // ── Rebuild water plane (world size may differ) ──────────────────────────
+    { float wl = cfg.WaterLevel, wsz = cfg.WorldSize;
+      float[] wq = { 0,wl,0,  wsz,wl,0,  wsz,wl,wsz,   0,wl,0,  wsz,wl,wsz,  0,wl,wsz };
+      gl.BindVertexArray(waterVao);
+      gl.BindBuffer(BufferTargetARB.ArrayBuffer, waterVbo);
+      gl.BufferData<float>(BufferTargetARB.ArrayBuffer, wq, BufferUsageARB.DynamicDraw); }
+    InitWaterTextures();
+
+    // ── Reset camera to frame the new terrain ────────────────────────────────
+    cam = Camera.FrameAerial(cfg.WorldSize, (minH + maxH) * 0.5f, cam.Aspect);
+
+    // ── Upload terrain texture atlas ─────────────────────────────────────────
+    if (terrainTex is not null)
+    {
+        Span<int> mt = stackalloc int[1]; gl.GetInteger(GLEnum.MaxTextureSize, mt);
+        int cap  = Math.Min(8192, mt[0] > 0 ? mt[0] : 8192);
+        int size = Math.Clamp(terrainTex.NativeSize, 2048, cap);
+        atlasCpu    = terrainTex.BakeAtlas(size);
+        terrainTexId = UploadTexture(atlasCpu);
+    }
+    gl.UseProgram(terrainProg);
+    gl.Uniform1(uHasTexT, terrainTexId != 0 ? 1 : 0);
+    if (terrainTex?.Detail is not null)
+    {
+        detailTexId = UploadDetailTexture(terrainTex.Detail);
+        gl.Uniform1(uDetailScale, terrainTex.DetailScale);
+    }
+    gl.Uniform1(uHasDetail, detailTexId != 0 ? 1 : 0);
+    UploadActivePaintTexture();
+
+    // ── Rebuild objects + markers ────────────────────────────────────────────
+    RebuildObjects();
+    UploadMarkers();
+
+    // ── Minimap, shadow, sun ─────────────────────────────────────────────────
+    BuildMinimap();
+    InitTerrainShadowOnLoad();
+    { var s0 = EffectiveSun(); sunElevationDeg = MathF.Asin(Math.Clamp(s0.Y, -1f, 1f)) * 180f / MathF.PI; sunAzimuthDeg = MathF.Atan2(s0.X, s0.Z) * 180f / MathF.PI; }
+    shadowMapDirty = true;
+
+    // ── Catalog, overgrowth ──────────────────────────────────────────────────
+    RebuildCatalog();
+    LoadOvergrowthSettings();
+
+    // ── Window title ─────────────────────────────────────────────────────────
+    window.Title = $"RefractorForge — {Path.GetFileName(dir)}";
+    Console.WriteLine($"Loaded '{Path.GetFileName(dir)}' in-place: {cfg.MaterialSize}^2, worldSize {cfg.WorldSize}.");
 }
 
 // Transient confirmation shown in the status bar (and echoed to the console). Fades out over a few seconds.
@@ -4956,6 +5221,10 @@ void OnRender(double dt)
     gl.Disable(EnableCap.ScissorTest);
     gl.Disable(EnableCap.Blend);
     gl.Enable(EnableCap.DepthTest);
+    // Use the startup screen's background color as the clear color while the startup screen is visible.
+    // This ensures the window shows the same dark navy as the card background when the splash closes,
+    // giving a seamless splash -> startup transition with no flash of a different color.
+    if (showStartupScreen) gl.ClearColor(0.118f, 0.165f, 0.220f, 1f);
     gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
     // Sky background. Order of preference: the level's CUBEMAP faces (a map's AltTex override, e.g. Immersed's hi-res
@@ -5743,9 +6012,6 @@ void MapperSubToolbar()
 
 void ToolButtons()
 {
-    if (ImGui.Button("New")) OpenNewMap();
-    ImGui.SameLine(); if (ImGui.Button("Open")) OpenLevel();
-    ImGui.SameLine(); if (ImGui.Button("Save")) DoSave();
     ImGui.SameLine(); Sep();
     MapperButton(0, "Sculpt & smooth the heightmap (F1)");      ImGui.SameLine();
     MapperButton(1, "Paint the ground material type (F2)");     ImGui.SameLine();
@@ -6864,59 +7130,57 @@ void DoCreateNewMap()
         }
 
         RefractorForge.Formats.LevelSaver.CreateNewLevel(dir, name, ncfg, nhm, new EnvironmentSettings(), null, nmPlayable);
-        // Persist the chosen target game beside the level (a tiny sidecar) so it survives the relaunch + future opens.
-        try { System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "refractorforge.game"), nmGameBf1942 ? "1942" : "vietnam"); } catch { }
 
-        var saved = Settings.Load();   // keep the current mesh/texture archives so the new map has a library
-        Settings.Save(new LevelPaths(dir, saved?.StdMesh, saved?.Objects, saved?.Textures));
+        var projPath = System.IO.Path.Combine(dir, name + ".rfproj");
+        var pf = new ProjectFile
+        {
+            Name            = name,
+            Game            = nmGameBf1942 ? "BF1942" : "BFVietnam",
+            // Level dir is inferred from the project file's parent folder; no Level field needed.
+            MeshArchives    = nmMeshArchives,
+            TextureArchives = nmTexArchives,
+        };
+        try { pf.Save(projPath); } catch { }
+
         Console.WriteLine($"Created new level '{name}' ({matSize}^2, world {worldSize} m) at {dir}");
-        RelaunchAndExit();
+        nmFromStartup = false;
+        nmMeshArchives = Array.Empty<string>();
+        nmTexArchives  = Array.Empty<string>();
+        ImGui.CloseCurrentPopup();
+        RelaunchWithProject(projPath);
     }
     catch (Exception ex) { nmError = ex.Message; }
 }
 
-void RelaunchAndExit()
+void RelaunchWithProject(string projPath)
 {
+    RecentProjects.Add(projPath);
     try
     {
-        var exe = Environment.ProcessPath;   // the apphost exe; with no args it loads Settings.Level (= the new map)
+        var exe = Environment.ProcessPath;
         if (!string.IsNullOrEmpty(exe))
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false });
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe)
+            {
+                UseShellExecute = false,
+                Arguments = $"\"{projPath}\" --relaunch",
+            });
     }
     catch (Exception ex) { Console.WriteLine($"Relaunch failed: {ex.Message}"); }
     window.Close();
 }
 
-// Open a different level: run the same native pickers the first-run flow uses, remember the choice, and
-// relaunch into the proven startup load path (a clean in-process swap would mean rebuilding all GL state).
+// Open a different level via the archive picker modal (triggered from File menu).
 void OpenLevel()
 {
-    try
-    {
-        var saved = Settings.Load();
-        string? lvl;
-        string[] lvlArchives = Array.Empty<string>();
-        var folder = Picker.Folder("Select the level FOLDER (Cancel to choose packed .rfa instead)", saved?.Level);
-        if (folder is not null) lvl = folder;
-        else
-        {
-            var rfas = Picker.Files("Select the level .rfa  (base + ANY patch .rfa together - Ctrl/Shift-click)", "RFA archives|*.rfa|All files|*.*", saved?.Level);
-            if (rfas.Length == 0) return;   // cancelled - keep the current level
-            lvlArchives = rfas; lvl = rfas[0];
-        }
-
-        var mesh = Picker.Files("Select ALL mesh/object archives - standardMesh.rfa, objects.rfa, patches (Ctrl/Shift-click). Cancel to skip.",
-                                "RFA archives|*.rfa|All files|*.*", (saved?.MeshArchives is { Length: > 0 } sm0 ? sm0[0] : saved?.StdMesh) ?? lvl);
-        var tex = Picker.Files("Select ALL texture archives - texture.rfa, texture_001.rfa, patches (Ctrl/Shift-click). Cancel to skip.",
-                               "RFA archives|*.rfa|All files|*.*", (saved?.Textures is { Length: > 0 } st ? st[0] : null) ?? lvl);
-        Settings.Save(new LevelPaths(lvl, null, null,
-            tex.Length > 0 ? tex : saved?.Textures,
-            mesh.Length > 0 ? mesh : saved?.MeshArchives,
-            lvlArchives.Length > 0 ? lvlArchives : null));
-        Console.WriteLine($"Opening {lvl} - restarting...");
-        RelaunchAndExit();
-    }
-    catch (Exception ex) { Console.WriteLine($"Open level failed: {ex.Message}"); }
+    olrLevelArchives = Array.Empty<string>();
+    olrMeshArchives  = Array.Empty<string>();
+    olrTexArchives   = Array.Empty<string>();
+    olrName          = "";
+    olrFolder        = levelDir is not null ? (Directory.Exists(levelDir) ? Path.GetDirectoryName(levelDir.TrimEnd('\\', '/')) ?? "" : Path.GetDirectoryName(levelDir) ?? "") : "";
+    olrGameBf1942    = gameIsBf1942;
+    olrFromStartup   = false;
+    olrError         = "";
+    olrRequest       = true;
 }
 
 // Pick a MOD folder (<Game>\Mods\<Mod>), then auto-collect the mod's Archives\*.rfa PLUS the base game's
@@ -6924,11 +7188,10 @@ void OpenLevel()
 // MeshLibrary/TextureLibrary are first-wins), parse the init.con mount chain, and pick a level .rfa from the mod.
 // Shared by File > Open Mod (which then relaunches) and the first-run startup (which loads in place). Pure
 // path-gathering (no window/UI state) so it is safe to call before the GL window exists. Returns false if cancelled.
-bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] texList)
+bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] texList, out string outModDir)
 {
-    lvlRfas = Array.Empty<string>(); meshList = Array.Empty<string>(); texList = Array.Empty<string>();
-    var saved = Settings.Load();
-    var modDir = Picker.Folder("Select the MOD folder  (e.g. ...\\Battlefield 1942\\Mods\\DesertCombat)", saved?.Level);
+    lvlRfas = Array.Empty<string>(); meshList = Array.Empty<string>(); texList = Array.Empty<string>(); outModDir = "";
+    var modDir = Picker.Folder("Select the MOD folder  (e.g. ...\\Battlefield 1942\\Mods\\DesertCombat)", levelDir);
     if (modDir is null) return false;
     // gameRoot = the install dir (the parent of the Mods\ folder the mod lives under).
     string? gameRoot = null;
@@ -6979,18 +7242,31 @@ bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] te
                            "RFA archives|*.rfa|All files|*.*", levelsHint);
     if (lvlRfas.Length == 0) { Console.WriteLine("Open mod: no level chosen."); return false; }
     Console.WriteLine($"Open mod {Path.GetFileName(modDir)}: chain [{string.Join(" -> ", modPaths.Select(p => Path.GetFileName(p)))}], {meshList.Length} mesh + {texList.Length} texture archive(s), level {Path.GetFileName(lvlRfas[0])}.");
+    outModDir = modDir;
     return true;
 }
 
-// File > Open Mod: gather the mod's paths, remember them, and relaunch into the standard load path.
+// File > Open Mod: gather the mod's paths, create a .rfproj, and relaunch.
 void OpenMod()
 {
     try
     {
-        if (!GatherModPaths(out var lvlRfas, out var meshList, out var texList)) return;
-        Settings.Save(new LevelPaths(lvlRfas[0], null, null, texList, meshList, lvlRfas));
+        if (!GatherModPaths(out var lvlRfas, out var meshList, out var texList, out var modDir)) return;
+        var baseName = Path.GetFileNameWithoutExtension(lvlRfas[0]);
+        var projDir  = Path.GetDirectoryName(Path.GetFullPath(lvlRfas[0])) ?? "";
+        var projPath = Path.Combine(projDir, baseName + ".rfproj");
+        var pf = new ProjectFile
+        {
+            Name            = baseName,
+            Game            = modDir.ToLowerInvariant().Contains("1942") ? "BF1942" : "BFVietnam",
+            ModFolder       = modDir,
+            LevelArchives   = lvlRfas,
+            MeshArchives    = meshList,
+            TextureArchives = texList,
+        };
+        pf.Save(projPath);
         Console.WriteLine("Opening mod - restarting...");
-        RelaunchAndExit();
+        RelaunchWithProject(projPath);
     }
     catch (Exception ex) { Console.WriteLine($"Open mod failed: {ex.Message}"); Toast("Open mod failed: " + ex.Message); }
 }
@@ -7086,6 +7362,312 @@ void DoScatter()
     scatterSeed++;                       // so a second Scatter gives a fresh layout
 }
 
+// ---- Startup screen: Blender-style project picker shown when no level is loaded ----
+// Full-window startup screen rendered as an opaque overlay over the (empty) editor.
+// Covers the entire window so the user never sees an empty scene.
+// Invoked LAST in BuildUi so it draws on top of every editor panel.
+void DrawStartupScreen()
+{
+    if (!showStartupScreen) return;
+
+    var fb   = window.FramebufferSize;
+    float fbW = fb.X, fbH = fb.Y;
+
+    // ---- Full-window opaque background matching the dark-navy clear color ----
+    const uint bgCol      = 0xFF1E2A38;   // dark navy  (same as gl.ClearColor when startup is active)
+    const uint cardCol    = 0xFF263344;   // slightly lighter card
+    const uint dividerCol = 0xFF3A4E62;
+    const uint amberCol   = 0xFFFFCA3A;
+
+    ImGui.SetNextWindowPos(Vector2.Zero, ImGuiCond.Always);
+    ImGui.SetNextWindowSize(new Vector2(fbW, fbH), ImGuiCond.Always);
+    ImGui.SetNextWindowBgAlpha(1f);
+    ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.118f, 0.165f, 0.220f, 1f));
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding,  Vector2.Zero);
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
+    ImGui.Begin("##startup_overlay", ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove
+                | ImGuiWindowFlags.NoNav | ImGuiWindowFlags.NoSavedSettings
+                | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoScrollbar);
+    ImGui.PopStyleVar(2);
+    ImGui.PopStyleColor();
+
+    var dl     = ImGui.GetWindowDrawList();
+    var origin = ImGui.GetWindowPos();   // always (0,0) but avoids hardcoding
+
+    // ---- Layout constants (all in window-local coords) ----
+    const float pad     = 32f;            // outer margin
+    const float cardW   = 580f;          // content card width
+    const float hdrH    = 72f;           // header strip height inside the card
+    const float btnH    = 40f;           // action button height
+    const float btnGap  = 10f;
+    const float footH   = btnH + pad * 1.5f;   // footer height (buttons + margin below)
+    float cardH = Math.Min(420f, fbH - pad * 2);
+    float cardX = MathF.Round((fbW - cardW) * 0.5f);
+    float cardY = MathF.Round((fbH - cardH) * 0.5f);
+
+    // ---- Card background ----
+    dl.AddRectFilled(origin + new Vector2(cardX, cardY),
+                     origin + new Vector2(cardX + cardW, cardY + cardH),
+                     cardCol, 6f);
+
+    // ---- Header strip ----
+    dl.AddRectFilled(origin + new Vector2(cardX, cardY),
+                     origin + new Vector2(cardX + cardW, cardY + hdrH),
+                     bgCol, 6f);
+    // fill the bottom corners of header (so only top corners are rounded)
+    dl.AddRectFilled(origin + new Vector2(cardX, cardY + hdrH - 8f),
+                     origin + new Vector2(cardX + cardW, cardY + hdrH),
+                     bgCol);
+
+    // Title + subtitle drawn with AddText so we avoid ImGui cursor gymnastics
+    float titleX = cardX + 20f, titleY = cardY + 14f;
+    dl.AddText(origin + new Vector2(titleX, titleY), amberCol, "RefractorForge");
+    dl.AddText(origin + new Vector2(titleX, titleY + 26f), 0xFFADBBCC, "BF1942 / BFVietnam Map Editor");
+
+    // ---- Divider between header and body ----
+    dl.AddLine(origin + new Vector2(cardX, cardY + hdrH),
+               origin + new Vector2(cardX + cardW, cardY + hdrH),
+               dividerCol);
+
+    // ---- Body: set ImGui cursor inside the card body ----
+    const float bodyPad = 16f;
+    float bodyTop  = cardY + hdrH + bodyPad;
+    float bodyLeft = cardX + bodyPad;
+    float bodyW    = cardW - bodyPad * 2;
+    float listH    = cardH - hdrH - footH - bodyPad * 2;
+
+    ImGui.SetCursorPos(new Vector2(bodyLeft, bodyTop));
+
+    // Recent projects label
+    ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.68f, 0.78f, 0.88f, 1f));
+    ImGui.Text("Recent Projects");
+    ImGui.PopStyleColor();
+
+    // Thin separator under label
+    var sepP = ImGui.GetCursorScreenPos();
+    dl.AddLine(sepP, sepP + new Vector2(bodyW, 0f), dividerCol);
+    ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 4f);
+    ImGui.SetCursorPosX(bodyLeft);
+
+    // Recent projects list in a clipped child
+    ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0f, 0f, 0f, 0f));
+    ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(0f, 2f));
+    ImGui.BeginChild("##su_list", new Vector2(bodyW, listH - 4f), ImGuiChildFlags.None, ImGuiWindowFlags.NoScrollbar);
+
+    var recent = RecentProjects.Load().Where(File.Exists).ToArray();
+    if (recent.Length == 0)
+    {
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 10f);
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.45f, 0.52f, 0.60f, 1f));
+        ImGui.SetCursorPosX(8f);
+        ImGui.Text("(no recent projects)");
+        ImGui.PopStyleColor();
+    }
+    else
+    {
+        float rowH = ImGui.GetTextLineHeight() * 2f + 6f;
+        for (int ri = 0; ri < recent.Length; ri++)
+        {
+            var  rp   = recent[ri];
+            var  proj = ProjectFile.Load(rp);
+            string pname = proj?.Name ?? Path.GetFileNameWithoutExtension(rp);
+            string game  = (proj?.Game ?? "").Contains("1942") ? "BF1942" : "BFVietnam";
+            string dir   = Path.GetDirectoryName(rp) ?? "";
+            if (dir.Length > 60) dir = "..." + dir[^57..];
+
+            var rowMin = ImGui.GetCursorScreenPos();
+            bool hovered = ImGui.IsMouseHoveringRect(rowMin, rowMin + new Vector2(bodyW, rowH));
+            if (hovered) dl.AddRectFilled(rowMin, rowMin + new Vector2(bodyW, rowH), 0x18FFFFFF, 3f);
+
+            ImGui.SetCursorPosX(10f);
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.92f, 0.92f, 0.92f, 1f));
+            ImGui.Text(pname);
+            ImGui.PopStyleColor();
+            ImGui.SameLine(0f, 0f);
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.50f, 0.60f, 0.72f, 1f));
+            ImGui.Text($"   [{game}]");
+            ImGui.PopStyleColor();
+
+            ImGui.SetCursorPosX(10f);
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.45f, 0.52f, 0.60f, 1f));
+            ImGui.Text(dir);
+            ImGui.PopStyleColor();
+
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(rp);
+
+            // Invisible selectable covering the whole row
+            ImGui.SetCursorScreenPos(rowMin);
+            if (ImGui.InvisibleButton($"##rp{ri}", new Vector2(bodyW, rowH)) && proj is not null)
+            {
+                showStartupScreen = false;
+                ImGui.EndChild();
+                ImGui.End();
+                RelaunchWithProject(rp);
+                return;
+            }
+            ImGui.Spacing();
+        }
+    }
+    ImGui.EndChild();
+    ImGui.PopStyleVar();
+    ImGui.PopStyleColor();
+
+    // ---- Footer: two action buttons ----
+    float footY  = cardY + cardH - footH + (footH - btnH) * 0.5f;
+    float btnW   = (bodyW - btnGap) * 0.5f;
+    float btn1X  = bodyLeft;
+    float btn2X  = bodyLeft + btnW + btnGap;
+
+    ImGui.SetCursorPos(new Vector2(btn1X, footY));
+
+    ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.14f, 0.33f, 0.58f, 1f));
+    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.20f, 0.45f, 0.74f, 1f));
+    ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.10f, 0.24f, 0.44f, 1f));
+    if (ImGui.Button("Open Project  (.rfproj)", new Vector2(btnW, btnH)))
+    {
+        ImGui.PopStyleColor(3);
+        var path = Picker.File("Open Project", "RefractorForge Project|*.rfproj|All files|*.*", null);
+        if (path is not null && ProjectFile.Load(path) is not null)
+        {
+            showStartupScreen = false;
+            ImGui.End();
+            RelaunchWithProject(path);
+            return;
+        }
+        // picker cancelled or invalid - screen stays open
+    }
+    else ImGui.PopStyleColor(3);
+
+    ImGui.SetCursorPos(new Vector2(btn2X, footY));
+
+    ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.12f, 0.38f, 0.20f, 1f));
+    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.17f, 0.52f, 0.28f, 1f));
+    ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.09f, 0.28f, 0.15f, 1f));
+    if (ImGui.Button("New Map", new Vector2(btnW, btnH)))
+    {
+        nmFromStartup = true;
+        ImGui.PopStyleColor(3);
+        ImGui.End();
+        OpenNewMap();
+        return;
+    }
+    else ImGui.PopStyleColor(3);
+
+    ImGui.End();
+}
+
+// ---- Project Settings modal ----
+void ProjectSettingsModal()
+{
+    if (projectSettingsRequest)
+    {
+        psGameBf1942 = gameIsBf1942;
+        psModFolder = DetectModFolder();
+        ImGui.OpenPopup("Project Settings");
+        projectSettingsRequest = false;
+    }
+
+    var fb2 = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fb2.X * 0.5f, fb2.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSizeConstraints(new Vector2(480f, 0f), new Vector2(480f, fb2.Y * 0.9f));
+    bool psOpen = true;
+    if (!ImGui.BeginPopupModal("Project Settings", ref psOpen, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
+        return;
+
+    ImGui.TextDisabled("Current project: " + (currentProjectPath is not null ? Path.GetFileName(currentProjectPath) : "(unsaved)"));
+    ImGui.Separator();
+    ImGui.Spacing();
+
+    int psGameIdx = psGameBf1942 ? 0 : 1;
+    if (ImGui.Combo("Target Game", ref psGameIdx, "Battlefield 1942\0Battlefield Vietnam\0"))
+        psGameBf1942 = psGameIdx == 0;
+    ImGui.TextDisabled(psGameBf1942 ? "BF1942: no overgrowth / tunnel features." : "BFVietnam: full feature set.");
+
+    ImGui.Spacing();
+    ImGui.TextDisabled("Level:");
+    ImGui.SameLine();
+    ImGui.TextUnformatted(levelDir is not null ? (levelDir.Length > 55 ? "..." + levelDir[^52..] : levelDir) : "(none)");
+
+    if (psModFolder.Length > 0)
+    {
+        ImGui.TextDisabled("Mod folder:");
+        ImGui.SameLine();
+        ImGui.TextUnformatted(psModFolder.Length > 55 ? "..." + psModFolder[^52..] : psModFolder);
+    }
+
+    ImGui.Spacing();
+    ImGui.Separator();
+
+    bool gameChanged = psGameBf1942 != gameIsBf1942;
+    if (gameChanged) ImGui.TextColored(new Vector4(1f, 0.85f, 0.2f, 1f), "Game type changed - Apply & Restart to take effect.");
+
+    ImGui.Spacing();
+    if (ImGui.Button("Apply & Restart", new Vector2(130f, 0f)) && gameChanged)
+    {
+        if (currentProjectPath is not null)
+        {
+            var pf = ProjectFile.Load(currentProjectPath);
+            if (pf is not null) { pf.Game = psGameBf1942 ? "BF1942" : "BFVietnam"; try { pf.Save(currentProjectPath); } catch { } }
+        }
+        ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
+        if (currentProjectPath is not null) RelaunchWithProject(currentProjectPath);
+        return;
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Close")) ImGui.CloseCurrentPopup();
+
+    ImGui.EndPopup();
+}
+
+// Read the mod folder from the current project file; fall back to heuristic from archive paths.
+string DetectModFolder()
+{
+    if (currentProjectPath is not null)
+    {
+        var pf = ProjectFile.Load(currentProjectPath);
+        if (pf?.ModFolder is { Length: > 0 } mf && Directory.Exists(mf)) return mf;
+    }
+    var archivePath = meshArchives.FirstOrDefault() ?? texPicks.FirstOrDefault() ?? levelDir;
+    if (archivePath is null) return "";
+    for (var d = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(archivePath)) ?? ""); d?.Parent is not null; d = d.Parent)
+        if (d.Name.Equals("Archives", StringComparison.OrdinalIgnoreCase)) return d.Parent.FullName;
+    return "";
+}
+
+// Save the current session as a .rfproj file chosen by the user.
+void SaveProjectAs()
+{
+    if (levelDir is null) { Toast("Nothing to save - open a level first."); return; }
+    string defaultName = currentProjectPath is not null
+        ? Path.GetFileNameWithoutExtension(currentProjectPath)
+        : Path.GetFileNameWithoutExtension(levelDir.TrimEnd('\\', '/'));
+    var savePath = Picker.Save("Save Project As", "RefractorForge Project|*.rfproj|All files|*.*", defaultName, currentProjectPath ?? levelDir);
+    if (savePath is null) return;
+    var proj = new ProjectFile
+    {
+        Name            = Path.GetFileNameWithoutExtension(savePath),
+        Game            = gameIsBf1942 ? "BF1942" : "BFVietnam",
+        ModFolder       = DetectModFolder() is { Length: > 0 } mf ? mf : null,
+        LevelArchives   = levelArchives,
+        MeshArchives    = meshArchives,
+        TextureArchives = texPicks,
+    };
+    proj.Save(savePath);
+    currentProjectPath = savePath;
+    RecentProjects.Add(savePath);
+    Toast($"Saved project: {Path.GetFileName(savePath)}");
+}
+
+// Open a .rfproj file and relaunch into it.
+void OpenProjectFile()
+{
+    var path = Picker.File("Open Project", "RefractorForge Project|*.rfproj|All files|*.*", currentProjectPath ?? levelDir);
+    if (path is null) return;
+    if (ProjectFile.Load(path) is null) { Toast("Could not read project file."); return; }
+    RelaunchWithProject(path);
+}
+
 void ScatterModal()
 {
     if (scatterRequest) { ImGui.OpenPopup("Scatter Objects"); scatterRequest = false; }
@@ -7119,6 +7701,217 @@ void ScatterModal()
     ImGui.SameLine();
     if (ImGui.Button("Close", new Vector2(120, 0))) { scatterError = ""; ImGui.CloseCurrentPopup(); }
     ImGui.EndPopup();
+}
+
+// Renders a compact multi-path list for a set of .rfa archives: shows truncated paths + Add/Remove buttons.
+// Mutates <paramref name="archives"/> in-place.
+void ArchiveListWidget(string label, ref string[] archives)
+{
+    ImGui.TextDisabled(label.Split('#')[0] + ":");
+    for (int i = 0; i < archives.Length; i++)
+    {
+        var display = archives[i].Length > 60 ? "..." + archives[i][^57..] : archives[i];
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.80f, 0.85f, 0.90f, 1f));
+        ImGui.TextUnformatted("  " + display);
+        ImGui.PopStyleColor();
+        ImGui.SameLine();
+        if (ImGui.SmallButton($"x##{label}{i}"))
+        {
+            var list = archives.ToList(); list.RemoveAt(i); archives = list.ToArray();
+            break;
+        }
+    }
+    if (ImGui.SmallButton($"Add...##{label}"))
+    {
+        var hint = archives.Length > 0 ? Path.GetDirectoryName(archives[0]) : null;
+        var picked = Picker.Files("Select .rfa archive(s)", "RFA archives|*.rfa|All files|*.*", hint);
+        if (picked.Length > 0)
+            archives = archives.Concat(picked).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+}
+
+// ---- Open Level RFA modal (archive picker shown on "Open Level RFA" from splash or File > Open Level) ----
+void OpenLevelRfaModal()
+{
+    if (olrRequest) { ImGui.OpenPopup("Open Level RFA"); olrRequest = false; }
+
+    var fb = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fb.X * 0.5f, fb.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSizeConstraints(new Vector2(520f, 0f), new Vector2(520f, fb.Y * 0.92f));
+
+    bool open = true;
+    if (!ImGui.BeginPopupModal("Open Level RFA", ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
+        return;
+
+    ImGui.InputText("Name", ref olrName, 64);
+    ImGui.PushItemWidth(-140);
+    ImGui.InputText("Project folder", ref olrFolder, 512);
+    ImGui.PopItemWidth();
+    ImGui.SameLine();
+    if (ImGui.Button("Browse...##olr"))
+    {
+        var f = Picker.Folder("Choose the project folder (level files will be saved here)", Directory.Exists(olrFolder) ? olrFolder : null);
+        if (f is not null) olrFolder = f;
+    }
+
+    ImGui.Separator();
+    int olrGameIdx = olrGameBf1942 ? 0 : 1;
+    ImGui.SetNextItemWidth(200f);
+    if (ImGui.Combo("Game##olr", ref olrGameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) olrGameBf1942 = olrGameIdx == 0;
+
+    ImGui.Separator();
+    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), "Archives");
+    ArchiveListWidget("Level archives##olr", ref olrLevelArchives);
+    ArchiveListWidget("Mesh archives##olr", ref olrMeshArchives);
+    ArchiveListWidget("Texture archives##olr", ref olrTexArchives);
+
+    if (!string.IsNullOrEmpty(olrError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), olrError);
+
+    ImGui.Separator();
+    if (ImGui.Button("Open", new Vector2(130, 0)))
+    {
+        olrError = "";
+        var name = olrName.Trim();
+        if (name.Length == 0) { olrError = "Enter a project name."; goto olrEnd; }
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) { olrError = "Name has invalid characters."; goto olrEnd; }
+        if (string.IsNullOrWhiteSpace(olrFolder) || !Directory.Exists(olrFolder)) { olrError = "Choose a valid project folder."; goto olrEnd; }
+        if (olrLevelArchives.Length == 0) { olrError = "Add at least one level .rfa."; goto olrEnd; }
+
+        // Create a dedicated subfolder for the project (mirrors the New Map convention).
+        var projDir  = Path.Combine(olrFolder, name);
+        var projPath = Path.Combine(projDir, name + ".rfproj");
+        try { Directory.CreateDirectory(projDir); }
+        catch (Exception ex) { olrError = $"Could not create project folder: {ex.Message}"; goto olrEnd; }
+        var pf = new ProjectFile
+        {
+            Name            = name,
+            Game            = olrGameBf1942 ? "BF1942" : "BFVietnam",
+            LevelArchives   = olrLevelArchives,
+            MeshArchives    = olrMeshArchives,
+            TextureArchives = olrTexArchives,
+        };
+        try { pf.Save(projPath); }
+        catch (Exception ex) { olrError = $"Could not save project: {ex.Message}"; goto olrEnd; }
+
+        olrFromStartup = false;
+        olrLevelArchives = Array.Empty<string>();
+        olrMeshArchives  = Array.Empty<string>();
+        olrTexArchives   = Array.Empty<string>();
+        ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
+        RelaunchWithProject(projPath);
+        return;
+
+        olrEnd:;
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Cancel", new Vector2(130, 0)))
+    {
+        olrError = "";
+        ImGui.CloseCurrentPopup();
+        if (olrFromStartup) { olrFromStartup = false; showStartupScreen = true; }
+    }
+
+    ImGui.EndPopup();
+
+    if (!open && olrFromStartup) { olrFromStartup = false; showStartupScreen = true; }
+}
+
+void OpenLevelFolder()
+{
+    olfLevelDir     = levelDir is not null && Directory.Exists(levelDir) ? levelDir : "";
+    olfName         = olfLevelDir.Length > 0 ? System.IO.Path.GetFileName(olfLevelDir.TrimEnd('\\', '/')) : "";
+    olfGameBf1942   = gameIsBf1942;
+    olfMeshArchives = Array.Empty<string>();
+    olfTexArchives  = Array.Empty<string>();
+    olfFromStartup  = false;
+    olfError        = "";
+    olfRequest      = true;
+}
+
+void OpenLevelFolderModal()
+{
+    if (olfRequest) { ImGui.OpenPopup("Open Level Folder"); olfRequest = false; }
+
+    var fb = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fb.X * 0.5f, fb.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSizeConstraints(new Vector2(520f, 0f), new Vector2(520f, fb.Y * 0.92f));
+
+    bool open = true;
+    if (!ImGui.BeginPopupModal("Open Level Folder", ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
+        return;
+
+    ImGui.InputText("Name", ref olfName, 64);
+
+    // Level folder = project folder: the .rfproj is saved directly inside the chosen folder.
+    ImGui.PushItemWidth(-140);
+    ImGui.InputText("Level folder", ref olfLevelDir, 512);
+    ImGui.PopItemWidth();
+    ImGui.SameLine();
+    if (ImGui.Button("Browse...##olf"))
+    {
+        var f = Picker.Folder("Choose the extracted level folder (project file will be saved here)", Directory.Exists(olfLevelDir) ? olfLevelDir : null);
+        if (f is not null)
+        {
+            olfLevelDir = f;
+            if (olfName.Length == 0) olfName = System.IO.Path.GetFileName(f.TrimEnd('\\', '/'));
+        }
+    }
+
+    ImGui.Separator();
+    int olfGameIdx = olfGameBf1942 ? 0 : 1;
+    ImGui.SetNextItemWidth(200f);
+    if (ImGui.Combo("Game##olf", ref olfGameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) olfGameBf1942 = olfGameIdx == 0;
+
+    ImGui.Separator();
+    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), "Archives  (optional)");
+    ArchiveListWidget("Mesh archives##olf", ref olfMeshArchives);
+    ArchiveListWidget("Texture archives##olf", ref olfTexArchives);
+
+    if (!string.IsNullOrEmpty(olfError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), olfError);
+
+    ImGui.Separator();
+    if (ImGui.Button("Open", new Vector2(130, 0)))
+    {
+        olfError = "";
+        var name = olfName.Trim();
+        if (name.Length == 0) { olfError = "Enter a project name."; goto olfEnd; }
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) { olfError = "Name has invalid characters."; goto olfEnd; }
+        if (string.IsNullOrWhiteSpace(olfLevelDir) || !Directory.Exists(olfLevelDir)) { olfError = "Choose a valid level folder."; goto olfEnd; }
+
+        // .rfproj lives directly in the level folder — no extra subfolder needed.
+        var projPath = Path.Combine(olfLevelDir, name + ".rfproj");
+        var pf = new ProjectFile
+        {
+            Name            = name,
+            Game            = olfGameBf1942 ? "BF1942" : "BFVietnam",
+            MeshArchives    = olfMeshArchives,
+            TextureArchives = olfTexArchives,
+        };
+        try { pf.Save(projPath); }
+        catch (Exception ex) { olfError = $"Could not save project: {ex.Message}"; goto olfEnd; }
+
+        olfFromStartup  = false;
+        olfMeshArchives = Array.Empty<string>();
+        olfTexArchives  = Array.Empty<string>();
+        ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
+        RelaunchWithProject(projPath);
+        return;
+
+        olfEnd:;
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Cancel", new Vector2(130, 0)))
+    {
+        olfError = "";
+        ImGui.CloseCurrentPopup();
+        if (olfFromStartup) { olfFromStartup = false; showStartupScreen = true; }
+    }
+
+    ImGui.EndPopup();
+
+    if (!open && olfFromStartup) { olfFromStartup = false; showStartupScreen = true; }
 }
 
 void NewMapModal()
@@ -7208,15 +8001,28 @@ void NewMapModal()
 
     int ms = nmMatSizes[Math.Clamp(nmMatSizeIdx, 0, nmMatSizes.Length - 1)];
     ImGui.TextDisabled($"{ms}x{ms} grid, {(float)Math.Clamp(nmWorldSize, 64, 131072) / ms:0.##} m/sample");
+
+    ImGui.Separator();
+    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), "Archives  (optional — used for the object/texture library)");
+    ArchiveListWidget("Mesh archives##nm", ref nmMeshArchives);
+    ArchiveListWidget("Texture archives##nm", ref nmTexArchives);
+
     if (!string.IsNullOrEmpty(nmError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), nmError);
 
     ImGui.Separator();
-    ImGui.TextDisabled("Create restarts the editor on the new map.");
     if (ImGui.Button("Create", new Vector2(130, 0))) DoCreateNewMap();
     ImGui.SameLine();
-    if (ImGui.Button("Cancel", new Vector2(130, 0))) { nmError = ""; ImGui.CloseCurrentPopup(); }
+    if (ImGui.Button("Cancel", new Vector2(130, 0)))
+    {
+        nmError = "";
+        ImGui.CloseCurrentPopup();
+        if (nmFromStartup) { nmFromStartup = false; showStartupScreen = true; }
+    }
 
     ImGui.EndPopup();
+
+    // If the user closed via the X or Escape rather than Cancel, also return to the startup screen.
+    if (!open && nmFromStartup) { nmFromStartup = false; showStartupScreen = true; }
 }
 
 // ---- Object-group prefabs (Battlecraft-style stamps) ----
@@ -8033,9 +8839,6 @@ void BuildUi()
         menuH = ImGui.GetWindowSize().Y;
         if (ImGui.BeginMenu("File"))
         {
-            if (ImGui.MenuItem("New Map...")) OpenNewMap();
-            if (ImGui.MenuItem("Open Level / .rfa...", "Ctrl+O")) OpenLevel();
-            if (ImGui.MenuItem("Open Mod...")) OpenMod();
             if (ImGui.MenuItem("Save", "Ctrl+S", false, so is not null && soPath is not null)) DoSave();
             if (ImGui.MenuItem("Test This Level (in-game)", "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads.");
@@ -8059,6 +8862,26 @@ void BuildUi()
             if (ImGui.MenuItem("   .lsb: flip Y (if mirrored top/bottom)", null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
             ImGui.Separator();
             if (ImGui.MenuItem("Exit")) window.Close();
+            ImGui.EndMenu();
+        }
+        if (ImGui.BeginMenu("Project"))
+        {
+            string projLabel = currentProjectPath is not null
+                ? Path.GetFileNameWithoutExtension(currentProjectPath)
+                : "(unsaved project)";
+            ImGui.MenuItem(projLabel, null, false, false);   // greyed-out label
+            ImGui.Separator();
+            if (ImGui.MenuItem("New Map...")) OpenNewMap();
+            if (ImGui.MenuItem("Open Level / .rfa...", "Ctrl+O")) OpenLevel();
+            if (ImGui.MenuItem("Open Extracted Level Folder...")) OpenLevelFolder();
+            if (ImGui.MenuItem("Save", "Ctrl+S", false, so is not null && soPath is not null)) DoSave();
+            ImGui.Separator();
+            if (ImGui.MenuItem("Save Project As...")) SaveProjectAs();
+            if (ImGui.MenuItem("Open Project (.rfproj)...")) OpenProjectFile();
+            ImGui.Separator();
+            if (ImGui.MenuItem("Project Settings...")) projectSettingsRequest = true;
+            ImGui.Separator();
+            if (ImGui.MenuItem("Switch Project...")) { showStartupScreen = true; }
             ImGui.EndMenu();
         }
         if (ImGui.BeginMenu("Edit"))
@@ -8321,7 +9144,11 @@ void BuildUi()
         }
     }
 
-    NewMapModal();      // top-level scope here: all panels' Begin/End are balanced, so the popups nest cleanly
+    DrawStartupScreen();   // full-window project picker; only visible when showStartupScreen is true
+    ProjectSettingsModal();
+    NewMapModal();
+    OpenLevelRfaModal();
+    OpenLevelFolderModal();   // top-level scope here: all panels' Begin/End are balanced, so the popups nest cleanly
     SavePrefabModal();
     CollabModal();
     ScatterModal();

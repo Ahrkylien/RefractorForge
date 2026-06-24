@@ -3,12 +3,6 @@ using System.Windows.Forms;
 
 namespace RefractorForge.Viewer;
 
-/// <summary>The level folder + mesh/texture archives the user last opened (persisted next to the exe).
-/// StdMesh/Objects are legacy single-archive fields (still read for back-compat); MeshArchives / LevelArchives
-/// are the unlimited lists (base + any patch .rfa).</summary>
-public record LevelPaths(string? Level, string? StdMesh, string? Objects, string[]? Textures = null,
-                         string[]? MeshArchives = null, string[]? LevelArchives = null);
-
 /// <summary>
 /// Native Windows folder/file pickers. WinForms dialogs are modal and run on a dedicated STA thread,
 /// so they work from the ordinary (MTA) program thread without an [STAThread] Main or a message loop.
@@ -96,25 +90,58 @@ public static class Picker
     }
 }
 
-/// <summary>Remembers the last-opened paths in refractorforge.json beside the executable.</summary>
-public static class Settings
+/// <summary>
+/// Persists the list of recently opened .rfproj paths in %APPDATA%\RefractorForge\recent.json.
+/// This is the only user-level state stored outside a project file.
+/// </summary>
+public static class RecentProjects
 {
-    private static string FilePath => Path.Combine(AppContext.BaseDirectory, "refractorforge.json");
+    private static string FilePath
+    {
+        get
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "RefractorForge");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "recent.json");
+        }
+    }
 
-    public static LevelPaths? Load()
+    public static string[] Load()
     {
         try
         {
             return System.IO.File.Exists(FilePath)
-                ? JsonSerializer.Deserialize<LevelPaths>(System.IO.File.ReadAllText(FilePath))
-                : null;
+                ? JsonSerializer.Deserialize<string[]>(System.IO.File.ReadAllText(FilePath)) ?? Array.Empty<string>()
+                : Array.Empty<string>();
         }
-        catch { return null; }
+        catch { return Array.Empty<string>(); }
     }
 
-    public static void Save(LevelPaths paths)
+    /// <summary>Prepend <paramref name="projectPath"/> to the list (max 10, deduped) and save.</summary>
+    public static void Add(string projectPath)
     {
-        try { System.IO.File.WriteAllText(FilePath, JsonSerializer.Serialize(paths, new JsonSerializerOptions { WriteIndented = true })); }
-        catch { /* non-fatal: just means we re-ask next time */ }
+        try
+        {
+            var list = Load().ToList();
+            list.RemoveAll(p => p.Equals(projectPath, StringComparison.OrdinalIgnoreCase));
+            list.Insert(0, projectPath);
+            if (list.Count > 10) list = list.Take(10).ToList();
+            System.IO.File.WriteAllText(FilePath, JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
+    /// <summary>Remove <paramref name="projectPath"/> from the list (e.g. after a failed load).</summary>
+    public static void Remove(string projectPath)
+    {
+        try
+        {
+            var list = Load().ToList();
+            if (list.RemoveAll(p => p.Equals(projectPath, StringComparison.OrdinalIgnoreCase)) == 0) return;
+            System.IO.File.WriteAllText(FilePath, JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
     }
 }
